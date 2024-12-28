@@ -1,0 +1,269 @@
+---
+title: 'Final Project in Machine Learning and Causal Inference'
+author: "Amber Walker, Clatice Mottet, and Mox Ballo"
+output: html_document
+bibliography: proj_bibliography.bib 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+PATH <- "/Users/moxballo/Documents/GitHub/project-smoking-weight-chapsticks"
+nhefs <- read.csv(file.path(PATH, "nhefs_complete.csv"))
+setwd(PATH)
+
+
+# Mox path: "/Users/moxballo/Documents/GitHub/project-smoking-weight-chapsticks" 
+
+# Load necessary libraries
+library(dplyr)
+library(geepack)  
+library(boot)
+library(ggplot2)
+library(CausalModels)
+library(tidyverse)
+library(readxl)
+library(Hmisc)
+library(lmtest)
+
+set.seed(123) # For reproducibility
+```
+
+## Inverse Probability Weighting
+
+```{r}
+# Function to estimate inverse probability weights
+calculate_ipw <- function(data, stabilized = FALSE) {
+  # Base formula for the propensity score model
+  ps_formula <- qsmk ~ sex + race + age + I(age^2) + 
+    as.factor(education) + smokeintensity + 
+    I(smokeintensity^2) + smokeyrs + I(smokeyrs^2) + 
+    as.factor(exercise) + as.factor(active) + wt71 + I(wt71^2)
+  
+  if (!stabilized) {
+    # Non-stabilized IPW
+    fit <- glm(ps_formula, family = binomial(), data = data)
+    data$w <- 1 / ifelse(data$qsmk == 0, 
+                         1 - predict(fit, type = "response"),
+                         predict(fit, type = "response"))
+  } else {
+    # Stabilized IPW
+    denom.fit <- glm(ps_formula, family = binomial(), data = data)
+    pd.qsmk <- predict(denom.fit, type = "response")
+    
+    numer.fit <- glm(qsmk ~ 1, family = binomial(), data = data)
+    pn.qsmk <- predict(numer.fit, type = "response")
+    
+    data$w <- ifelse(data$qsmk == 0, 
+                     (1 - pn.qsmk) / (1 - pd.qsmk), 
+                     pn.qsmk / pd.qsmk)
+  }
+  
+  return(data)
+}
+```
+
+
+```{r}
+# IPW summary stats
+ipw_data <- calculate_ipw(nhefs, stabilized = FALSE)
+summary(ipw_data$w)
+```
+
+```{r}
+# stabilized IPW summary stats
+ipw_data_stabilized <- calculate_ipw(nhefs, stabilized = TRUE)
+summary(ipw_data_stabilized$w)
+```
+
+### Marginal Structural Models
+
+After calculating the inverse probability weights, we can fit a marginal structural model to estimate the causal effect of the treatment variable (`qsmk`) on the outcome variable (`wt82_71`). We will use the `geeglm` function from the `geepack` package to fit the marginal structural model.
+
+```{r}
+# Function to fit a marginal structural model
+fit_msm <- function(data, formula, id_column, weights_column) {
+  library(geepack)  # Ensure geepack is loaded for geeglm
+  msm_model <- geeglm(formula, data = data, weights = data[[weights_column]], id = data[[id_column]], corstr = "independence")
+  
+  return(msm_model)
+}
+
+# Function to summarize the MSM results
+summarize_msm <- function(msm_model) {
+  summary_msm <- summary(msm_model)
+  
+  beta <- coef(msm_model)
+  SE <- coef(summary_msm)[,2]
+  lcl <- beta - qnorm(0.975) * SE
+  ucl <- beta + qnorm(0.975) * SE
+  results <- cbind(beta, lcl, ucl)
+  
+  return(results)
+}
+
+# Define the analysis pipeline
+analyze_causal_effect <- function(data, id_column = "seqn", stabilized = FALSE) {
+  data_ipw <- calculate_ipw(data, stabilized = stabilized)
+  
+  msm_model <- fit_msm(data_ipw, wt82_71 ~ qsmk, id_column, "w")
+  
+  msm_results <- summarize_msm(msm_model)
+  
+  return(msm_results)
+}
+```
+
+```{r}
+# Define the main function to perform standardization and bootstrapping
+standardize_and_bootstrap <- function(data, num_bootstraps = 1000) {
+  # Define the standardization function to be used in bootstrapping
+  standardization_bootstrap <- function(data, indices) {
+    d <- data[indices, ] # Use only the bootstrap sample
+    d$interv <- -1
+    
+    # Setting the treatment to 0 (untreated)
+    d0 <- d
+    d0$interv <- 0
+    d0$qsmk <- 0
+    d0$wt82_71 <- NA
+    
+    # Setting the treatment to 1 (treated)
+    d1 <- d
+    d1$interv <- 1
+    d1$qsmk <- 1
+    d1$wt82_71 <- NA
+    
+    # Combine the datasets
+    d.onesample <- rbind(d, d0, d1)
+    
+    # Fit the model
+    fit <- glm(wt82_71 ~ qsmk + sex + race + age + I(age^2) + 
+                  as.factor(education) + smokeintensity + 
+                  I(smokeintensity^2) + smokeyrs + I(smokeyrs^2) + 
+                  as.factor(exercise) + as.factor(active) + wt71 + I(wt71^2), 
+                data = d.onesample)
+    
+    # Predict the mean outcome for each intervention scenario
+    d.onesample$predicted_meanY <- predict(fit, d.onesample)
+    
+    # Calculate the mean outcomes
+    mean1 <- mean(d.onesample$predicted_meanY[d.onesample$interv == -1])
+    mean0 <- mean(d.onesample$predicted_meanY[d.onesample$interv == 0])
+    mean_treated <- mean(d.onesample$predicted_meanY[d.onesample$interv == 1])
+    
+    # Calculate the standardized outcome
+    standardized_outcome <- mean_treated - mean0
+    
+    return(c(mean1 = mean1, mean0 = mean0, mean_treated = mean_treated, standardized_outcome = standardized_outcome))
+  }
+  
+  # Perform bootstrapping
+  boot_results <- boot(data = data, statistic = standardization_bootstrap, R = num_bootstraps)
+  
+  # Calculate confidence intervals
+  se <- apply(boot_results$t, 2, sd)
+  means <- boot_results$t0
+  ll <- means - qnorm(0.975) * se
+  ul <- means + qnorm(0.975) * se
+  
+  # Combine the results into a data frame
+  bootstrap_df <- data.frame(
+    Measure = c("Observed", "No Treatment", "Treatment", "Treatment - No Treatment"),
+    Mean = means,
+    SE = se,
+    Lower_CI = ll,
+    Upper_CI = ul
+  )
+  
+  # Return the results
+  list(standardized_means = boot_results$t0, bootstrap_results = bootstrap_df)
+}
+```
+
+```{r}
+combined_results <- standardize_and_bootstrap(nhefs, num_bootstraps = 100)
+print(combined_results$bootstrap_results)
+```
+# Causal Models
+
+```{r}
+confounders <- c("sex", "race", "age", "education", "smokeintensity",
+                 "smokeyrs", "exercise", "active", "wt71")
+
+nhefs$qsmk <- as.factor(nhefs$qsmk)
+init_params(wt82_71, qsmk,
+            covariates = confounders,
+            data = nhefs, simple = F)
+
+```
+
+# IP Weighting
+
+
+
+```{r}
+ip.model <- ipweighting(nhefs, SW = FALSE)
+print(ip.model)
+```
+
+```{r}
+ip.model <- ipweighting(nhefs, p.simple = TRUE)
+print(ip.model)
+```
+
+
+
+```{r}
+model <- standardization(data = nhefs, f = wt82_71 ~ qsmk + sex + race + age + I(age^2) + 
+                  as.factor(education) + smokeintensity + I(smokeintensity^2) + smokeyrs + 
+                  I(smokeyrs^2) + as.factor(exercise) + as.factor(active) + wt71 + I(wt71^2), 
+                  simple = TRUE, n.boot = 1000)
+print(model)
+summary(model)
+print(model$ATE.summary)
+
+
+```
+
+
+
+```{r}
+results_df <- data.frame(
+  Method = c("IPW-MSM Using Standard Weights", "IPW-MSM Using Stabilized Weights", "Standardization",
+             "G-Estimation for Single Parameter", "G-Estimation for Multiple Parameters","Doubly-Robust Models"),
+  ATE_Estimate = c(beta_msm_weighted, 
+                   beta_msm_weighted_stabilized, 
+                   standardized_results$bootstrap_results$Mean[4], 
+                   gest.model$ATE.summary[1], 
+                   gest.model2$ATE.summary[1], 
+                   dr.model$ATE.summary[1]), # replace with your actual estimates
+  Lower_CI = c(beta_msm_weighted - qnorm(0.975) * se_msm_weighted, 
+               beta_msm_weighted_stabilized - qnorm(0.975) * se_msm_weighted_stabilized, 
+               standardized_results$bootstrap_results$Lower_CI[4], 
+               gest.model$ATE.summary[2], 
+               gest.model2$ATE.summary[2], 
+               dr.model$ATE.summary[3]),    # replace with your actual lower CI
+  Upper_CI = c(beta_msm_weighted + qnorm(0.975) * se_msm_weighted, 
+               beta_msm_weighted_stabilized + qnorm(0.975) * se_msm_weighted_stabilized,
+               standardized_results$bootstrap_results$Upper_CI[4], 
+               gest.model$ATE.summary[3], 
+               gest.model2$ATE.summary[3], 
+               dr.model$ATE.summary[4])       # replace with your actual upper CI
+)
+
+# Convert the dataframe to long format for easier plotting with ggplot2
+results_long <- tidyr::gather(results_df, key = "CI", value = "Value", Lower_CI, Upper_CI)
+
+# Plot
+ggplot(data = results_df, aes(x = Method, y = ATE_Estimate)) + 
+  geom_point() + 
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), width = 0.2) +
+  geom_hline(aes(yintercept = 3.5), linetype = "dashed", color = "red") +  # Replace 3.5 with the Doubly-Robust Estimate
+  theme_minimal() +
+  labs(title = "Comparison of Causal Inference Methods",
+       x = "Method", y = "Average Treatment Effect") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```

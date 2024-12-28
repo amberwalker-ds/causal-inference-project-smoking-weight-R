@@ -1,0 +1,964 @@
+---
+title: 'Final Project in Machine Learning and Causal Inference'
+author: "Amber Walker, Clarice Mottet, and Mox Ballo"
+output: html_document
+bibliography: proj_bibliography.bib 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#PATH <- "/Users/moxballo/Documents/GitHub/project-smoking-weight-chapsticks"
+
+#amber's path
+PATH <- "/Users/moxballo/Documents/GitHub/project-smoking-weight-chapsticks" 
+
+nhefs <- read.csv(file.path(PATH, "nhefs_complete.csv"))
+nhefs_data <- read.csv(file.path(PATH, "nhefs.csv"))
+setwd(PATH)
+
+# Mox path: "/Users/moxballo/Documents/GitHub/project-smoking-weight-chapsticks" 
+# Amber path: "/Users/amberwalker/project-smoking-weight-chapsticks"
+
+# Load necessary libraries
+library(dplyr)
+library(geepack)  
+library(boot)
+library(ggplot2)
+library(CausalModels)
+library(tidyverse)
+library(readxl)
+library(Hmisc)
+library(lmtest)
+library(sem)
+library(tidyr)
+library(modelsummary)
+library(kableExtra)
+library(tidyverse)
+
+```
+
+```{r, warning=FALSE, echo=FALSE, include=FALSE}
+create_combined_table <- function(weights_w, weights_sw, sex, qsmk) {
+  # Create data frames for the cross-tabulations
+  df_w <- data.frame(sex = sex, qsmk = qsmk, weights = weights_w)
+  df_sw <- data.frame(sex = sex, qsmk = qsmk, weights = weights_sw)
+  
+  # Cross-tabulate weights by sex and qsmk
+  table_w <- xtabs(weights ~ sex + qsmk, data = df_w)
+  table_sw <- xtabs(weights ~ sex + qsmk, data = df_sw)
+  
+  # Convert the cross-tabulations to data frames
+  df_table_w <- as.data.frame(table_w) %>%
+    mutate(model = 'Standard Weights')
+  df_table_sw <- as.data.frame(table_sw) %>%
+    mutate(model = 'Stabilized Weights')
+  
+  # Combine the tables
+  combined_table <- bind_rows(df_table_w, df_table_sw)
+  
+  # Spread the table to wide format for easier comparison
+  wide_table <- combined_table %>%
+    unite(col = "sex_qsmk", sex, qsmk, sep = "_") %>%
+    spread(key = model, value = Freq)
+  
+  return(wide_table)
+}
+```
+
+
+## Abstract
+This study aimed to uncover how quitting smoking impacts weight change, drawing on data from the National Health and Nutrition Examination Survey I Epidemiologic Follow-up Study (NHEFS). Various factors were adjusted such as sex, age, and smoking intensity, among others, to account for potential biases. Results from inverse probability weighting and marginal structural models (IPW-MSM), standardization, and G-estimation suggest an average treatment effect of approximately 3.44 to 3.46 kg of weight gain for individuals who quit smoking compared to those who did not. Instrumental variable estimation, while informative, resulted in a potential bias due to the weak instrument used. This study ultimately highlights the multifaceted impact of quitting smoking on weight change and also points out how important it is to employ a variety of analytical techniques to fully understand this tricky relationship.
+
+# Introduction
+
+The main question we are interested in is to estimate the causal effect of smoking on weight: **what is the causal effect of smoking cessation on body weight change**? The data used for this analysis is the National Health and Nutrition Examination Survey Data I Epidemiologic Follow-up Study (NHEFS). The NHEFS is a prospective cohort study that was conducted in the United States from 1971 to 197. The study was designed to investigate the relationship between lifestyle, nutrition, and health. The data contains information on 1629 individuals, including their smoking status, weight, and other covariates, wherein the outcome of interest is the change of weight between the baseline and the follow-up. This project shall follow the methods used in @robins2000marginal. 
+
+To start, we formalize the question as we want to estimate the average causal effect of smoking cessation (`$A$`) on weight gain (`$Y$`), adjusting for a set of covariates (`$L$`) such as sex, age, smoking intensity, etc. Our primary focus is on the causal difference, i.e., the expected weight change if all participants had quit smoking versus if none had quit:
+
+$$ E[Y^{a=1}] - E[Y^{a=0}] $$
+where $a$ is the treatment variable indicating smoking cessation (1 for quitters, 0 for non-quitters). This project shall use several estimation methods such as inverse probability weighting, marginal structural models, standardization, G-estimation, and instrumental variable estimation.
+
+# Results
+
+## Explaratory Data Analysis
+Our study begins with exploratory data analysis to examine patterns in the data and explore the relationships between variables, focusing particularly on identifying possible confounders for the causal effect of smoking cessation on weight gain. It's important to note that correlation does not mean causation here, so we will approach our initial data exploration with caution when interpreting the results.
+
+#### Quick overview of data
+```{r}
+cat("Number of participants in the treatment group:", sum(nhefs_data$qsmk), "\n")
+cat("Number of participants in the control group:", sum(1 - nhefs_data$qsmk), "\n")
+# check if there is censoring
+cat("Number of participants with missing weight at follow-up:", sum(is.na(nhefs_data$wt82_71)), "\n")
+```
+
+#### Descriptive summary statistics
+
+```{r, warning=FALSE}
+# key variables
+key_variables <- c('wt82_71', 'age', 'sex', 'sbp', 'dbp')
+
+# descriptive statistics for potential outcome and confounders
+descriptive_stats <- nhefs_data %>%
+  select(key_variables) %>%
+  summary()
+
+# Separate data by treatment status for comparison
+# For treated individuals
+treated_stats <- nhefs_data %>%
+  filter(qsmk == 1) %>%
+  select(key_variables) %>%
+  summary()
+
+# For untreated individuals
+untreated_stats <- nhefs_data %>%
+  filter(qsmk == 0) %>%
+  select(key_variables) %>%
+  summary()
+
+# To view the results
+descriptive_stats
+treated_stats
+untreated_stats
+
+```
+
+##### Overall Population
+- Weight Gain (wt82_71): The participants gained 2.64 kg, on average, over the study period, with a standard deviation of 7.88 kg. Weight gain varied a lot within both groups, from a loss of 41.28 kg to a gain of 48.54 kg.
+- Age: The average age was approximately 44 years, ranging from 25 to 74 years.
+- Sex: About 51% of the participants are female suggesting a pretty balanced distribution between male and female participants.
+- Blood Pressure (SBP/DBP): The average systolic blood pressure is around 129 mmHg, and diastolic blood pressure is around 78 mmHg.
+
+##### Treated Group (Quitters)
+- Weight Gain: Quitters gained an average of 4.53 kg, suggesting a possible effect of smoking cessation on weight gain, however this needs to be examined more closely. The variation is also quite large in this group.
+- Age: Slightly older on average (approximately 47 years) compared to the overall population.
+- Sex: Around 44.6% of the quitters are female, indicating a possible difference in quitting rates by sex.
+- Blood Pressure: Slightly higher blood pressure on average compared to the overall population.
+
+##### Untreated Group (Continued Smokers)
+- Weight Gain: Gained an average of 1.98 kg, which is lower than the quitters. We will examine this more closely in the following sections of our study.
+- Age: Younger on average (approximately 43 years) than the quitters.
+- Sex: About 53.2% are female, differing slightly from the treated group.
+- Blood Pressure: Slightly lower than in the treated group.
+
+#### Simple linear regression
+Here we fit an ordinary least squares regression model with weight gain as the outcome and smoking cessation as the predictor. We are estimating the average difference in weight gain between individuals who quit smoking and those who did not, otherwise known as the association difference: $E[Y|A=1] - E[Y|A=0]$.
+
+The associational difference (different from causal effect difference) is based on observed data and does not account for potential confounders that may influence both the predictor and the outcome unless they are controlled for in the model (which we will see in further sections) [@hernan2020causal].
+
+```{r}
+#here we create a simple linear model to get a confidence interval on weight difference
+
+# Fit an OLS regression model
+ols <- lm(wt82_71 ~ qsmk, data = nhefs_data)
+
+# Display the summary of the regression model
+summary(ols)
+
+# Get the estimate for the 'qsmk' coefficient
+est <- coef(ols)["qsmk"]
+
+# Get the confidence intervals for the 'qsmk' coefficient
+conf_int <- confint(ols, "qsmk", level = 0.95)
+
+# Extract the lower and upper bounds of the confidence interval
+lo <- conf_int[1]
+hi <- conf_int[2]
+
+# Print the estimate and confidence interval
+cat(sprintf('            estimate   95%% C.I.\n'))
+cat(sprintf('difference   %6.2f   (%0.1f, %0.1f)\n', est, lo, hi))
+
+```
+
+Looking at the results from our OLS regression, we can see an associational difference of 2.54, with 95% confidence interval from 1.7 to 3.4. We see that most people gained weight, but quitters
+gained more weight on average.
+
+Next we'll calculate the average weight gain for each group, treatment group (quitter) and control group (those who continued smoking).
+```{r}
+#check average weight gain for quitters and non-quitters
+ave_gain_quit <- mean(nhefs_data$wt82_71[nhefs_data$qsmk == 1], na.rm = TRUE)
+ave_gain_noquit <- mean(nhefs_data$wt82_71[nhefs_data$qsmk == 0], na.rm = TRUE)
+
+cat("Average weight gain\n")
+cat(sprintf("      quitters: %0.1f kg\n", ave_gain_quit))
+cat(sprintf("  non-quitters: %0.1f kg\n", ave_gain_noquit))
+
+```
+
+$\hat{E}[Y|A=1] = 4.5$ for quitters and $\hat{E}[Y|A=0] = 2.5$ for non-quitters, the associational difference being 2.5. Which solidifies our results from the OLS regression above.
+
+#### Table 12.1 from Hernan
+Now we'll look at the means of all potential confounding variables in the dataset. Here we are grouping by the (qsmk) variable (indicating smoking cessation status) and then calculating the means for various baseline characteristics within each group. We are taking inspiration from table 12.1 in the book from @hernan2020causal. Different from their tale, we have added a few more variables to look the difference in their means.
+
+### 
+```{r}
+nhefs.nmv <- nhefs_data %>%
+  mutate(
+    inactive = as.integer(active == 2),
+    no_exercise = as.integer(exercise == 2)
+  )
+
+# Calculate the means or proportions for each group
+table_data <- nhefs.nmv %>%
+  group_by(qsmk) %>%
+  summarise(
+    Age = mean(age, na.rm = TRUE),
+    Men = mean(sex == '0', na.rm = TRUE) * 100, # assuming 'sex' contains "Male" or "Female"
+    White = mean(race == 0, na.rm = TRUE) * 100, # assuming 'race' contains "White" or other
+    University = mean(education == 5, na.rm = TRUE) * 100, # replace with your actual data
+    Weight = mean(wt71, na.rm = TRUE),
+    Cigarettes_per_day = mean(smokeintensity, na.rm = TRUE),
+    Years_smoking = mean(smokeyrs, na.rm = TRUE),
+    no_exercise_percent = 100 * mean(no_exercise, na.rm = TRUE),
+    inactive_percent = 100 * mean(inactive, na.rm = TRUE), # replace with your actual data
+    alcohol_frequency = mean(alcoholfreq, na.rm = TRUE),
+    dbp = mean(dbp, na.rm = TRUE),
+    sbp = mean(sbp, na.rm = TRUE),
+    income = mean(income, na.rm = TRUE)
+    
+  ) %>%
+  pivot_longer(cols = -qsmk, names_to = "Mean baseline characteristics", values_to = "value") %>%
+  pivot_wider(names_from = qsmk, values_from = value)
+
+# Create the table with kable
+kable(table_data, caption = "Table 12.1 Mean baseline characteristics", digits = 1) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+
+#### Distribution of weight gain
+Next, we'll visualize the distribution of weight gain and explore the relationships between smoking cessation, potential confounders, and weight gain. We start with the distribution of weight gain across all participants and then by treatment status.
+```{r}
+# Ensure the data doesn't have rows with NA in wt82_71 for accurate plotting
+nhefs_data_filtered <- nhefs_data %>% filter(!is.na(wt82_71))
+
+# Plot distribution of weight gain for all participants with semi-transparent colors
+nhefs_data_filtered %>%
+  ggplot(aes(x = wt82_71)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "blue", color = "black", alpha = 0.5) + # Adjust alpha here for histogram
+  geom_density(color = "darkblue", size = 1, alpha = 0.5) + # Adjust alpha here for density line if needed
+  geom_vline(xintercept = mean(nhefs_data_filtered$wt82_71, na.rm = TRUE), color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Distribution of Weight Gain in All Participants",
+       x = "Weight Gain (kg)",
+       y = "Density") +
+  theme_minimal() +
+  theme(panel.grid = element_blank()) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05)))
+
+# Plot distribution of weight gain by treatment status with semi-transparent colors
+nhefs_data_filtered %>%
+  ggplot(aes(x = wt82_71, fill = as.factor(qsmk))) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, color = "black", alpha = 0.5, position = "identity") + # Adjust alpha here for histogram
+  geom_density(aes(color = as.factor(qsmk)), size = 1, alpha = 0.5) + # Adjust alpha here for density line
+  geom_vline(xintercept = mean(nhefs_data_filtered[nhefs_data_filtered$qsmk == 0, ]$wt82_71, na.rm = TRUE),
+             color = "blue", linetype = "dashed", size = 1) +
+  geom_vline(xintercept = mean(nhefs_data_filtered[nhefs_data_filtered$qsmk == 1, ]$wt82_71, na.rm = TRUE),
+             color = "red", linetype = "dashed", size = 1) +
+  scale_fill_manual(values = c("blue", "red"), labels = c("Non-Quitters", "Quitters")) +
+  scale_color_manual(values = c("blue", "red"), labels = c("Non-Quitters", "Quitters")) +
+  labs(title = "Distribution of Weight Gain by Smoking Cessation Status",
+       x = "Weight Gain (kg)",
+       y = "Density",
+       fill = "Treatment Status",
+       color = "Treatment Status") +
+  theme_minimal() +
+  theme(panel.grid = element_blank()) +
+  guides(fill = guide_legend(override.aes = list(alpha = 1)))
+
+
+```
+
+The first plot shows the overall distribution of weight gain among all participants. The mean weight gain, as shown by the red dashed line, is around 2.64 kg. The distribution appears slightly right-skewed, pointing to the hypothesis that more participants experienced weight gain than loss, with a few outliers showing significant weight gain or loss.
+
+The second plot compares the distribution of weight gain between those who quit smoking (quitters) and those who continued to smoke (non-quitters). The treatment group (red) tend to have a broader and right-skewed distribution, with a higher mean weight gain (red dashed line) than the control group (blue dashed line), suggesting that quitting smoking might be associated with greater weight gain, again we will explore this more in further sections.
+
+The mean weight gain for quitters is visibly higher than for non-quitters, this aligns with our descriptive statistics above.
+
+#### Explore the relationships between potential confounders and both the treatment (smoking cessation) and the outcome (weight gain)
+We will use box plots to visually look at and compare the distribution of weight gain across the potential confounders age and sex
+
+```{r}
+# Filter out rows with NA values in wt82_71 before plotting
+nhefs_data_filtered <- nhefs_data %>% filter(!is.na(wt82_71))
+
+# Box plot for weight gain by sex and smoking cessation status with filtered data
+nhefs_data_filtered %>%
+  ggplot(aes(x = as.factor(sex), y = wt82_71, fill = as.factor(qsmk))) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Weight Gain by Sex and Smoking Cessation Status",
+       x = "Sex (0: Male, 1: Female)",
+       y = "Weight Gain (kg)",
+       fill = "Quit Smoking") +
+  theme_minimal()
+
+# Categorize age into groups for easier visualization in the filtered dataset
+nhefs_data_filtered$age_group <- cut(nhefs_data_filtered$age, breaks = c(24, 34, 44, 54, 64, 75), labels = c('25-34', '35-44', '45-54', '55-64', '65-74'))
+
+# Box plot for weight gain by age group and smoking cessation status with filtered data
+nhefs_data_filtered %>%
+  ggplot(aes(x = age_group, y = wt82_71, fill = as.factor(qsmk))) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set3") +
+  labs(title = "Weight Gain by Age Group and Smoking Cessation Status",
+       x = "Age Group",
+       y = "Weight Gain (kg)",
+       fill = "Quit Smoking") +
+  theme_minimal()
+
+
+```
+The first box plot shows us the distribution of weight gain separated by sex and smoking cessation status. There doesn't seem to be too big of a difference in the median weight gain between males and females within the same smoking cessation group. However, this would require further analysis. Further confirming our hypothesis from earlier, for both sexes, individuals who quit smoking tend to have a higher median weight gain compared to those who continued smoking.
+
+When looking at weight gain across different age groups, it appears that potentially older people tend to gain less weight than younger people, but we'll need to explore this further. The variability in weight gain also appears to be greater among quitters in most age groups.
+
+Next we can investigate other variables that might influence both the decision to quit smoking and weight gain. Such variables could include health indicators, socioeconomic status, and lifestyle factors. We'll look at health indicators: systolic and diastolic blood pressure (sbp, dbp) and cholesterol levels. Socioeconomic status such as income and education, influencing both lifestyle choices and health outcomes.
+Lifestyle factors such as alcohol consumption could influence both the likelihood of quitting smoking and changes in weight.
+
+```{r}
+# Assuming 'nhefs_data' and 'potential_confounders' are defined
+potential_confounders <- c('sbp', 'dbp', 'cholesterol', 'income', 'alcoholhowmuch', 'education', 'smokeintensity' )
+
+# Summary statistics for these confounders by smoking cessation status
+confounders_by_status <- nhefs_data %>%
+  group_by(qsmk) %>%
+  summarise(across(all_of(potential_confounders), mean, na.rm = TRUE))
+
+print(confounders_by_status)
+
+```
+
+```{r}
+# For the visualizations, first ensure all potential confounders are in a long format
+nhefs_data_long <- nhefs_data %>%
+  pivot_longer(cols = all_of(potential_confounders), names_to = "confounder", values_to = "value")
+
+# Visualizing the relationship of potential confounders with smoking cessation status
+ggplot(nhefs_data_long, aes(x = as.factor(qsmk), y = value, fill = as.factor(qsmk))) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Pastel1") +
+  facet_wrap(~confounder, scales = "free", ncol = 3) +
+  labs(title = "Potential Confounders by Smoking Cessation Status",
+       x = "Quit Smoking",
+       y = "Value") +
+  theme_minimal() +
+  theme(legend.position = "none") # Optionally remove the legend if it's redundant
+
+```
+
+The box plots and summary statistics reveal how the variables vary between individuals who quit smoking (1) and those who did not (0).
+
+- Individuals who quit smoking tend to have slightly higher systolic and diastolic blood pressure on average compared to those who continued smoking. This difference could be related to weight gain often associated with quitting smoking, among other factors.
+
+- Similarly, cholesterol levels are slightly higher on average in individuals who quit smoking. This could reflect dietary changes, weight gain, or other lifestyle factors associated with smoking cessation.
+
+- The average income appears slightly higher in the group that quit smoking, though the difference is not too large. Socioeconomic status may influence both the ability to quit smoking and access to resources that impact weight change.
+
+- The distribution of education levels indicates that non-quitters (0) have a lower median education level compared to quitters (1). The quitters' group also shows more variability and higher values in education level.
+
+- Interestingly, alcohol consumption is slightly lower on average in individuals who quit smoking. This might indicate a shift toward healthier lifestyle choices in this group or could possibly be related to the reasons for quitting.
+
+- As expected, the non-quitters show higher median smoking intensity, which makes sense as this group includes active smokers. Quitters have lower values, indicating their cessation of smoking.
+
+The results suggest that blood pressure, cholesterol levels, income, education and alcohol consumption may possibly act as potential confounders in the relationship between smoking cessation and weight gain. They are associated with the treatment and could also potentially influence the outcome, either directly or through related health behaviors.
+
+Let's delve deeper into the above potential confounders. We'll look at a correlation analysis to see how each potential confounder is related to weight gain. We plot the correlation coefficients, these coefficients measure the strength and direction of a linear relationship between two variables. In the context of our analysis, the correlation coefficients describe how strongly potential confounders are linearly related to weight gain and in which direction (positive or negative). The values range from -1 to 1, where 1 means a perfectly positive linear relationship and -1 means a perfect negative linear relationship.
+
+```{r}
+
+confounders_with_weight_gain <- c(potential_confounders, 'wt82_71')
+
+# Compute correlation matrix
+correlation_matrix <- cor(nhefs_data[confounders_with_weight_gain], use="complete.obs")
+
+# Extract correlations specifically with weight gain and remove its own correlation
+weight_gain_correlation <- correlation_matrix["wt82_71", potential_confounders]
+
+# Convert to a data frame for ggplot
+correlation_df <- data.frame(
+  Confounder = names(weight_gain_correlation),
+  Correlation = as.numeric(weight_gain_correlation)
+)
+
+# Plotting using ggplot2
+library(ggplot2)
+
+ggplot(correlation_df, aes(x = reorder(Confounder, Correlation), y = Correlation, fill = Correlation)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  labs(title = "Correlation of Potential Confounders with Weight Gain", x = "Potential Confounder", y = "Correlation Coefficient") +
+  coord_flip() +  # This makes it easier to read the confounder names
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  theme_minimal()
+
+# Print the correlation coefficients
+print(correlation_df)
+
+
+```
+Looking at the plot, we can see systolic blood pressure (SBP) shows a very weak and essentially negligible correlation with weight gain. Diastolic blood pressure (DBP), on the other hand, shows a positive correlation, suggesting that higher DBP might be associated with slightly greater weight gain. However, it's important to note that the correlation coefficient is only about 0.14 which indicates the relationship is not strong. 'Smokerintensity' also shows a positive correlation, but the relationship is weak.
+
+There's a weak negative correlation with cholesterol and weight gain, indicating that higher cholesterol levels might be slightly associated with lower weight gain, but again, the relationship is not strong. 
+
+Education and income both show a weak positive correlation with weight gain (although education is higher) suggesting that better education and higher income may be be associated with possibly greater weight gain, though the relationships are weak.
+
+Alcohol consumption also shows a very weak and essentially negligible correlation with weight gain, indicating no significant relationship based on this analysis.
+
+After doing some further digging, we found that higher cholesterol levels may be a results smoking smoking (@maeda2003effects) and since it also may affect weight gain, we will choose to leave this variable out of analysis as it could be a decedent of treatment. Similar with blood pressure, since lower blood pressure may be a result of smoking cessation (@OKUBO2004167) and a cause of weight gain, we have chosen to leave 'dbp' out of analysis.
+
+Given these results, when considering the causal effect of smoking cessation on weight gain, it might be important to consider education and income, even if their direct correlations with weight gain are pretty weak. Controlling for these variables can help us ensure that any estimated effect of smoking cessation on weight gain is not confounded by these factors.
+
+## Inverse Probability Weighting
+
+Inverse Probability (IP) weighting is a method employed to estimate the causal effect of a treatment on an outcome by adjusting for confounding variables. It is particularly useful in observational studies where random assignment to treatment conditions is not feasible. The goal is to mimic a randomized controlled trial (RCT) environment by creating a pseudo-population in which the distribution of confounders is balanced across treatment groups. (@chesnaye2022introduction)
+
+In the context of analyzing the causal effect of smoking cessation on weight gain, IP weighting involves assigning weights to individuals in the study based on their probability of receiving the treatment (in this case, smoking cessation) given their covariates. These probabilities are known as propensity scores. The weights are the inverse of these propensity scores for the treated individuals and the inverse of one minus the propensity scores for the control individuals. This process ensures that the treated and control groups are balanced with respect to the confounding variables, allowing for a more accurate estimation of the treatment effect. 
+
+The IP weights can be done in two ways: standard IP weights and stabilized IP weights. In standard IP weighting, the weight for each individual in the treatment group is the inverse of the probability of receiving the treatment given their covariates. For the control group, it's the inverse of the probability of not receiving the treatment. This approach is represented as:
+
+*   For quitters: $W_{quitters} = \frac{1}{\hat{P}(A=1|L)}​$
+*   For non-quitters: $W^{nonquitters} = \frac{1}{1 - \hat{P}(A=1|L)} $
+
+In stabilized IP weighting, the weights are adjusted to reduce the variance of the treatment effect estimate. This is particularly useful when the treatment variable is highly correlated with the covariates. The stabilized weights are calculated as:
+*   For quitters: $ SW_{quitters} = \frac{\hat{P}(A = 1)}{\hat{P}(A=1|L)} $
+*   For non-quitters: $ SW^{nonquitters} = \frac{1 - \hat{P}(A = 1)}{1 - \hat{P}(A=1|L)}$ 
+
+```{r}
+calculate_ipw <- function(data, stabilized = FALSE) {
+  if (!stabilized) {
+    # Standard IPW calculation
+    fit <- glm(qsmk ~ sex + race + age + I(age^2) + 
+                 as.factor(education) + smokeintensity + 
+                 I(smokeintensity^2) + smokeyrs + I(smokeyrs^2) + 
+                 as.factor(exercise) + as.factor(active) + wt71 + I(wt71^2), 
+               family = binomial(), data = data)
+    p.qsmk.obs <- ifelse(data$qsmk == 0, 1 - predict(fit, type = "response"),
+                         predict(fit, type = "response"))
+    data$w <- 1 / p.qsmk.obs
+  } else {
+    # Stabilized IPW calculation
+    denom.fit <- glm(qsmk ~ as.factor(sex) + as.factor(race) + age + I(age^2) + 
+                       as.factor(education) + smokeintensity + 
+                       I(smokeintensity^2) + smokeyrs + I(smokeyrs^2) + 
+                       as.factor(exercise) + as.factor(active) + wt71 + I(wt71^2), 
+                     family = binomial(), data = data)
+    pd.qsmk <- predict(denom.fit, type = "response")
+    
+    numer.fit <- glm(qsmk ~ 1, family = binomial(), data = data)
+    pn.qsmk <- predict(numer.fit, type = "response")
+    
+    data$w <- ifelse(data$qsmk == 0, ((1 - pn.qsmk) / (1 - pd.qsmk)), (pn.qsmk / pd.qsmk))
+  }
+  
+  return(data)
+}
+```
+
+
+The `calculate_ipw` function is designed to compute inverse probability weights (IPWs) for each individual. When `stabilized` is set to `FALSE`, the function computes the standard IPWs. It does so by fitting a logistic regression model (`glm`) using the treatment variable (`qsmk`) and other covariates such as age, sex, and smoking intensity (`smokeintensity`). The predicted probabilities from this model are used to determine the likelihood of each individual receiving the treatment. Inverse probabilities are then calculated by taking the reciprocal of these predicted probabilities. These weights are used to create a pseudo-population where the distribution of covariates is similar across treated and untreated groups. This balancing allows for a more accurate estimation of the treatment effect. 
+
+When `stabilized` is set to `TRUE`, the function computes stabilized IPWs. This involves fitting two logistic regression models: one for the treatment variable and covariates and another for the treatment variable alone. The predicted probabilities from these models are used to calculate the stabilized weights. These weights are designed to reduce the variance of the treatment effect estimate, particularly in cases where the treatment variable is highly correlated with the covariates.
+
+The function returns the dataset with the calculated IPWs, which can then be used to fit a marginal structural model (MSM) or other causal models to estimate the treatment effect.
+
+### IPW Using Standard Weights
+
+Using the function `calculate_ipw`, we can calculate the inverse probability weights for the NHEFS dataset. We will then examine the summary statistics of the weights to ensure they are well-distributed and have a reasonable variance. This step will help us assess the quality of the IPW estimation and the balance achieved between the treatment and control groups.
+
+```{r}
+nhefs_ipw <- calculate_ipw(nhefs)
+summary(nhefs_ipw$w)
+var(nhefs_ipw$w)
+```
+Based on this result, the maximum weight is quite high at 16.7. Moreover, mean weight is almost double the median, indicating a right-skewed distribution of weights. The variance of the weights is 2.17, which is relatively large compared to the mean, indicating substantial variability in the weights.
+
+```{r}
+print(paste("Sum of weights in the treatment group:", sum(nhefs_ipw$w[nhefs_ipw$qsmk == 1])))
+print(paste("Sum of weights in the control group:", sum(nhefs_ipw$w[nhefs_ipw$qsmk == 0])))
+```
+
+However, looking at the sum of weights for those who received the treatment (`qsmk == 1`) and those who did not (`qsmk == 0`) to be very close: 1560.82 and 1565.36, respectively. This means that after applying IPW, the treatment and control groups are balanced, making it fairer to compare them. This balance helps us be more confident that any differences we see in outcomes are likely due to the treatment itself, rather than other factors. The sums of weights act like the number of people in each group after we adjust for how likely they were to receive the treatment.
+
+
+### IPW Using Stabilized Weights
+
+Now, we look at the stabilized weights to see if they provide a better balance between the treatment and control groups. We will calculate the stabilized IPWs using the `calculate_ipw` function with the `stabilized` argument set to `TRUE`:
+
+```{r}
+
+nhefs_ipw_stabilized <- calculate_ipw(nhefs, stabilized = TRUE)
+summary(nhefs_ipw_stabilized$w)
+var(nhefs_ipw_stabilized$w)
+```
+For the stabilized weights, weights are much more tightly distributed, with a minimum weight of 0.3312 and a maximum of only 4.2977. The mean and median are very close to 1, suggesting a less skewed distribution, and the standard deviation of 0.083 is much smaller relative to the mean, indicating less variability in the weights.
+
+```{r}
+print(paste("Sum of weights in the treatment group:", sum(nhefs_ipw_stabilized$w[nhefs_ipw_stabilized$qsmk == 1])))
+print(paste("Sum of weights in the control group:", sum(nhefs_ipw_stabilized$w[nhefs_ipw_stabilized$qsmk == 0])))
+```
+
+The application of inverse probability weighting (IPW) with stabilized weights reveals a significant disparity in the sum of weights between the treatment group (401.67) and the control group (1162.52). Given these points, stabilized weights seem to have less variability and a tighter distribution around the mean, which is generally desirable for stability and efficiency of the estimates.
+
+### Marginal Structural Models
+We can now use these weights to fit a marginal structural model (MSM) to estimate the causal effect of smoking cessation on weight gain. MSMs are a type of regression model that accounts for time-varying confounders and time-varying treatment status. They are particularly useful in longitudinal studies where the treatment status changes over time and can be influenced by past confounders. MSMs allow us to estimate the causal effect of a time-varying treatment on an outcome while adjusting for confounders that may change over time. @robins2000marginal
+
+We can estimate the causal difference by fitting the mean model $E[Y|A] = \theta_0 + \theta_1A$ by fitting the linear mean model:
+```{r}
+calculate_ipw_and_fit_msm <- function(data, formula, use_stabilized = FALSE) {
+  if (use_stabilized) {
+    # Stabilized IPW calculation
+    denom.fit <- glm(qsmk ~ as.factor(sex) + as.factor(race) + age + I(age^2) +
+                       as.factor(education) + smokeintensity + I(smokeintensity^2) +
+                       smokeyrs + I(smokeyrs^2) + as.factor(exercise) + 
+                       as.factor(active) + wt71 + I(wt71^2),
+                     family = binomial(), data = data)
+    pd.qsmk <- predict(denom.fit, type = "response")
+    
+    numer.fit <- glm(qsmk ~ 1, family = binomial(), data = data)
+    pn.qsmk <- predict(numer.fit, type = "response")
+    
+    data$w <- ifelse(data$qsmk == 0, ((1 - pn.qsmk) / (1 - pd.qsmk)), (pn.qsmk / pd.qsmk))
+  } else {
+    # Standard IPW calculation
+    fit <- glm(qsmk ~ sex + race + age + I(age^2) +
+                 as.factor(education) + smokeintensity + I(smokeintensity^2) +
+                 smokeyrs + I(smokeyrs^2) + as.factor(exercise) + 
+                 as.factor(active) + wt71 + I(wt71^2),
+               family = binomial(), data = data)
+    p.qsmk.obs <- ifelse(data$qsmk == 0, 1 - predict(fit, type = "response"),
+                         predict(fit, type = "response"))
+    
+    data$w <- 1 / p.qsmk.obs
+  }
+  
+  # Fit MSM using the calculated weights
+  msm_model <- geeglm(formula, data = data, weights = w, id = seqn, corstr = "independence")
+  summary_msm <- summary(msm_model)
+  
+  # Return both IPW-adjusted data and MSM fit summary
+  return(list(ipw_data = data, msm_summary = summary_msm))
+}
+```
+
+### Marginal Structural Models Using Standard Weights
+Using standard IP weights, we can fit a marginal structural model to estimate the causal effect of smoking cessation on weight gain:
+```{r}
+msm_weighted <- calculate_ipw_and_fit_msm(nhefs, wt82_71 ~ qsmk, use_stabilized = FALSE)
+beta_msm_weighted <- coef(msm_weighted$msm_summary)[2,1]
+se_msm_weighted <- coef(msm_weighted$msm_summary)[2,2]
+# table of beta and lower and upper bounds
+print(paste("Beta:", beta_msm_weighted))
+print(paste("Lower bound:", beta_msm_weighted - qnorm(0.975) * se_msm_weighted))
+print(paste("Upper bound:", beta_msm_weighted + qnorm(0.975) * se_msm_weighted))
+```
+Based on the result, we can see that smoking causes to gain weight by 3.44 on average, with a 95% confidence interval of (2.41, 4.47). This means that, on average, individuals who quit smoking gained 3.44 kg more than those who did not quit, after adjusting for confounding variables.
+
+
+### Marginal Structural Models Using Stabilized Weights
+
+Now, using stabilized IP weights, by setting `use_stabilized = TRUE`, we can fit a marginal structural model to estimate the causal effect of smoking cessation on weight gain:
+```{r}
+msm_weighted_stabilized <- calculate_ipw_and_fit_msm(nhefs, wt82_71 ~ qsmk, use_stabilized = TRUE)
+beta_msm_weighted_stabilized <- coef(msm_weighted_stabilized$msm_summary)[2,1]
+se_msm_weighted_stabilized <- coef(msm_weighted_stabilized$msm_summary)[2,2]
+print(paste("Beta for stabilized weights:", beta_msm_weighted_stabilized))
+print(paste("Lower bound:", beta_msm_weighted_stabilized - qnorm(0.975) * se_msm_weighted_stabilized))
+print(paste("Upper bound:", beta_msm_weighted_stabilized + qnorm(0.975) * se_msm_weighted_stabilized))
+
+```
+The results show that the causal effect of smoking cessation on weight gain is estimated also 3.44 kg, with a 95% confidence interval of (2.41, 4.47). 
+
+This table summarizes the comparison between standard and stabilized IP weighting methods across different aspects and their effects on the study's pseudo-population. The sums of weights for both males and females, differentiated by their smoking cessation status (quitters vs. non-quitters), illustrate the numerical impact of these approaches on balancing covariates between treatment and control groups for causal inference analysis.
+
+```{r}
+contingency_table <- create_combined_table(msm_weighted$ipw_data$w, msm_weighted_stabilized$ipw_data$w, msm_weighted_stabilized$ipw_data$sex, msm_weighted_stabilized$ipw_data$qsmk)
+
+# Print the combined table
+print(contingency_table)
+ # xtabs(msm_weighted_stabilized$ipw_data$w ~ msm_weighted_stabilized$ipw_data$sex + msm_weighted_stabilized$ipw_data$qsmk)
+```
+
+```{r}
+ate_standard <- beta_msm_weighted
+ate_stabilized <- beta_msm_weighted_stabilized
+LI_standard <- beta_msm_weighted - qnorm(0.975) * se_msm_weighted
+UI_standard <- beta_msm_weighted + qnorm(0.975) * se_msm_weighted
+LI_stabilized <- beta_msm_weighted_stabilized - qnorm(0.975) * se_msm_weighted_stabilized
+UI_stabilized <- beta_msm_weighted_stabilized + qnorm(0.975) * se_msm_weighted_stabilized
+
+print(paste("ATE using standard IP weights:", ate_standard))
+print(paste("95% Confidence Interval for ATE using standard IP weights:", LI_standard, "-", UI_standard))
+print(paste("ATE using stabilized IP weights:", ate_stabilized))
+print(paste("95% Confidence Interval for ATE using stabilized IP weights:", LI_stabilized, "-", UI_stabilized))
+
+```
+
+
+## Standardization
+
+Now, we will use standardization to estimate the causal effect of smoking cessation on weight gain. Standardization is a method that allows us to compare the average outcome under different treatment scenarios while adjusting for confounding variables. By standardizing the outcome variable for each treatment group, we can estimate the average outcome for each group and calculate the standardized effect size: $$ \sum_l E[Y|A = a, C = 0, L = l] \times P(L = l)$$. 
+
+Here, $E[Y|A = a, C = 0, L = l]$ denotes the expected outcome among those treated, adjusted for being uncensored, within each stratum $l$ of confounders. This process involves calculating the average outcome for individuals who quit smoking within each distinct stratum formed by combinations of the 9 covariates. These calculated average outcomes are then standardized by applying weights corresponding to the prevalence of each stratum $l$ in the overall population, represented as $P(L = l)$.
+
+The result of this process is a weighting mechanism where strata with greater representation in the population receive higher weights, ensuring that the standardized mean outcome accurately reflects the broader population distribution, accounting for variations in the confounding variables.
+
+```{r}
+standardize_and_bootstrap <- function(data, num_bootstraps = 1000) {
+  # Define the standardization function to be used in bootstrapping
+  standardization_bootstrap <- function(data, indices) {
+    d <- data[indices, ] # Use only the bootstrap sample
+    d$interv <- -1
+    
+    # Setting the treatment to 0 (untreated)
+    d0 <- d
+    d0$interv <- 0
+    d0$qsmk <- 0
+    d0$wt82_71 <- NA
+    
+    # Setting the treatment to 1 (treated)
+    d1 <- d
+    d1$interv <- 1
+    d1$qsmk <- 1
+    d1$wt82_71 <- NA
+    
+    # Combine the datasets
+    d.onesample <- rbind(d, d0, d1)
+    
+    # Fit the model
+    fit <- glm(wt82_71 ~ qsmk + sex + race + age + I(age^2) + 
+                  as.factor(education) + smokeintensity + 
+                  I(smokeintensity^2) + smokeyrs + I(smokeyrs^2) + 
+                  as.factor(exercise) + as.factor(active) + wt71 + I(wt71^2), 
+                data = d.onesample)
+    
+    # Predict the mean outcome for each intervention scenario
+    d.onesample$predicted_meanY <- predict(fit, d.onesample)
+    
+    # Calculate the mean outcomes
+    mean1 <- mean(d.onesample$predicted_meanY[d.onesample$interv == -1])
+    mean0 <- mean(d.onesample$predicted_meanY[d.onesample$interv == 0])
+    mean_treated <- mean(d.onesample$predicted_meanY[d.onesample$interv == 1])
+    
+    # Calculate the standardized outcome
+    standardized_outcome <- mean_treated - mean0
+    
+    return(c(mean1 = mean1, mean0 = mean0, mean_treated = mean_treated, standardized_outcome = standardized_outcome))
+  }
+  
+  # Perform bootstrapping
+  boot_results <- boot(data = data, statistic = standardization_bootstrap, R = num_bootstraps)
+  
+  # Calculate confidence intervals
+  se <- apply(boot_results$t, 2, sd)
+  means <- boot_results$t0
+  ll <- means - qnorm(0.975) * se
+  ul <- means + qnorm(0.975) * se
+  
+  # Combine the results into a data frame
+  bootstrap_df <- data.frame(
+    Measure = c("Observed", "No Treatment", "Treatment", "Treatment - No Treatment"),
+    Mean = means,
+    SE = se,
+    Lower_CI = ll,
+    Upper_CI = ul
+  )
+  
+  # Return the results
+  list(standardized_means = boot_results$t0, bootstrap_results = bootstrap_df)
+}
+```
+
+To address the complexities presented by high-dimensional data with a plethora of confounders, our strategy encompasses the application of nonparametric methods for standardizing the data. This choice is predicated on the need for an analysis framework that remains robust against the intricacies of such data. Importantly, this method circumvents the direct computation of prevalences $P(L = l)$, focusing instead on:
+
+$$ 
+\frac{1}{n} \sum_{i=1}^{n} \hat{E}[Y|A = a, C = 0, L_i]
+$$ 
+
+Effectively, this enables us to conceptualize the weighted mean through nested expectations:
+
+$$ 
+E[E[Y|A = a, C = 0, L]]
+$$
+Our estimation approach is methodical, beginning with the generation of three distinct versions of each subject in the dataset:
+
+- The **first version** is an exact replica of the original dataset.
+- The **second version** simulates the scenario where no treatment is administered ($A = 0$), with the outcome accordingly marked as missing.
+- The **third version** depicts the scenario with treatment ($A = 1$), with the outcome also set to missing.
+
+A linear regression model is then employed to assess the mean outcome, considering the treatment, potential covariates, and their interactions as independent variables. This model aids in predicting outcomes for the modified second and third versions, thereby providing mean estimates for each combination of confounders $L$, segregated by treatment status ($A = 0$ and $A = 1$ respectively). The mean of these predicted values for the untreated (second version) and the treated (third version) groups elucidates the standardized mean outcomes. The discrepancy between these outcomes subsequently delineates the causal effect, offering insights into the impact of the treatment under study. We then use bootstrapping methods to compute the confidence intervals: 
+
+```{r}
+standardized_results <- standardize_and_bootstrap(nhefs, num_bootstraps = 1000)
+print(standardized_results$bootstrap_results)
+```
+
+The results of the standardization analysis reveal that the average weight gain for individuals who quit smoking is estimated to be 3.46 kg, with a 95% confidence interval of (2.5, 4.42). This indicates that smoking cessation is associated with a significant increase in body weight, after adjusting for confounding variables. The standardized effect size provides a robust estimate of the causal effect of smoking cessation on weight gain, accounting for the distribution of covariates in the population.
+
+```{r}
+standardized_effect <- standardized_results$bootstrap_results[4, "Mean"]
+LI_standardized <- standardized_results$bootstrap_results[4, "Lower_CI"]
+UI_standardized <- standardized_results$bootstrap_results[4, "Upper_CI"]
+
+print(paste("Standardized Effect Size:", standardized_effect))
+print(paste("95% Confidence Interval for Standardized Effect Size:", LI_standardized, "-", UI_standardized))
+```
+
+
+
+## G-Estimation of Structural Nested Models
+
+G-estimation is a method that allows us to estimate the causal effect of a treatment on an outcome while adjusting for time-varying confounders. Structural Nested Models are a type of causal model that can account for time-varying treatment and confounders, making them particularly useful in longitudinal studies where the treatment status changes over time. 
+ 
+We utilize g-estimation to assess the causal effect of smoking cessation on weight gain similar to the algorithm in @robins2000marginal. This method allows for the adjustment of confounders, offering insights into how causal effects vary with confounder values. We aim to estimate:
+
+$$
+E[Y^{a = 1} | L] - E[Y^{a = 0} | L]
+$$
+
+where $Y$ represents weight gain, $a$ denotes smoking cessation, and $L$ signifies the set of confounders. We assume that the treatment is independent of the potential outcome under no treatment, given covariates $L$:
+
+$$
+Pr[A = 1 | Y^{a = 0}, L] = Pr[A = 1 | L]
+$$
+
+This assumption guides the construction of a logistic model for estimating the probability of treatment, considering the potential outcome under no treatment and covariates $L$. A well-specified model, under true conditional exchangeability, implies $\alpha_1 = 0$:
+
+$$
+logit Pr[A = 1 | Y^{a = 0}, L] = \alpha_0 + \alpha_1Y^{a = 0} + \alpha_2L,
+$$
+
+with $\alpha_2$ representing the parameters associated with each covariate.
+
+This analytical approach allows us to explore the nuanced effects of smoking cessation on weight gain, considering the influence of individual smoking intensity and baseline characteristics.
+ 
+In this part of the project, we will use `CausalModels` package to estimate the causal effect of smoking cessation on weight gain using G-estimation of Structural Nested Models (SNM). The CausalModels package provides a convenient interface for fitting SNMs and estimating causal effects. @anderson2023r
+
+
+### G-Estimation Model for Single Parameter 
+In the context of our analysis, we will fit a G-estimation model to estimate the average treatment effect (ATE) of smoking cessation on weight gain. The model will adjust for a set of confounders that we will initialize to use the `CausalModels` package. 
+
+```{r, warning=FALSE}
+confounders <- c("sex", "race", "age", "education", "smokeintensity",
+                 "smokeyrs", "exercise", "active", "wt71")
+
+nhefs$qsmk <- as.factor(nhefs$qsmk)
+init_params(wt82_71, qsmk,
+            covariates = confounders,
+            data = nhefs, simple = F)
+
+causal_model <- qsmk ~ sex + race + age + I(age^2) + as.factor(education) + smokeintensity + I(smokeintensity^2) + smokeyrs + I(smokeyrs^2) + as.factor(exercise) + as.factor(active) + wt71 + I(wt71^2)
+```
+
+We will then fit the model using the `gestimation` function and examine the estimated ATE and its confidence interval. Looking at the default model, it only included interactions. We are now going to fit a model that is similar to the one used in the IPW and standardization analysis, which includes the main effects of the covariates:
+
+```{r, warning=FALSE}
+gest.model <- gestimation(nhefs, f = causal_model,
+                  family = "binomial", simple = TRUE,
+                  type = "one.linear", n.boot = 150)
+gest.model$ATE.summary
+```
+The result implies that quitting smoking is causally associated with an average weight gain of about 3.44 kg, with a 95% confidence interval ranging from approximately 2.15 to 4.73 kg. 
+
+```{r}
+ate_gest <- gest.model$ATE
+LI_gest <- gest.model$ATE.summary[[3]]
+UI_gest <- gest.model$ATE.summary[[4]]
+
+print(paste("Average Treatment Effect (ATE) using G-Estimation:", ate_gest))
+print(paste("95% Confidence Interval for ATE:", LI_gest, "-", UI_gest))
+```
+
+
+### G-Estimation Model for Single Parameters with Grid Search
+
+In our exploration of g-estimation to evaluate the causal effect of smoking cessation on weight gain, we emphasize a practical and effective technique known as grid search. This method is paramount in our estimation of structural nested models, which are pivotal for understanding how treatments influence outcomes in observational studies.
+
+For single parameter, we conceptualize the causal effect as the expected difference in outcomes across treatment states. For simplicity, we initially assume a uniform effect across all subjects:
+
+$$
+E[Y^{a = 1} - Y^{a = 0}| L] = \beta_1a,
+$$
+
+This model assumes a consistent treatment effect, $\beta_1$, signifying the average impact of treatment across the study population. To estimate the causal effect, we introduce an additive model relating treatment effect to observed outcomes. This approach allows us to infer counterfactual scenarios and estimate the treatment's average causal effect, represented by $\psi_1$.
+
+G-estimation leverages logistic regression to model the probability of receiving treatment based on counterfactual outcomes and covariates. Our aim is to identify the $\psi$ value that aligns with an absence of treatment effect, thereby zeroing the parameter $\alpha_1$:
+
+$$
+logit Pr[A = 1|H(\psi), L] = \alpha_0 + \alpha_1 H(\psi) + \alpha_2L,
+$$
+
+A grid search method is then employed, fitting multiple logistic regression models across a spectrum of $\psi$ values to find the one that achieves our target criterion.
+
+The practical execution of this grid search, alongside the estimation of our model's parameters, illustrates our analytical approach to discerning the average causal effect of smoking cessation, focusing on the technique rather than the broader theoretical foundations of rank preservation.
+
+```{r, warning=FALSE}
+grid1 <- seq(from = -5,to = 5, by = 0.01)
+
+gest.model2 <- gestimation(nhefs, grid = grid1, f = causal_model,
+                  family = "binomial", simple = TRUE,
+                  type = "one.grid")
+gest.model2$ATE.summary
+
+```
+The use of a grid search in this instance allows for an exploration of a range of ATE values that smoking cessation might have on weight gain, identified as being plausibly between 2.57 and 4.41 kg This range is informative for understanding the potential effects of quitting smoking without the precision usually afforded by the calculation of standard errors.
+
+```{r}
+ate_gest_grid <- gest.model2$ATE
+LI_gest_grid <- gest.model2$ATE.summary[[3]]
+UI_gest_grid <- gest.model2$ATE.summary[[4]]
+
+print(paste("Average Treatment Effect (ATE) using G-Estimation with Grid Search:", ate_gest_grid))
+print(paste("95% Confidence Interval for ATE:", LI_gest_grid, "-", UI_gest_grid))
+
+```
+
+## Propensity Score Matching and Doubly-Robust Estimators
+
+Propensity score matching is a method used to estimate the causal effect of a treatment on an outcome by creating comparable groups of treated and untreated individuals based on their propensity to receive the treatment. The propensity score is the probability of receiving the treatment given a set of covariates. By matching individuals with similar propensity scores, we can create balanced groups that allow for a more accurate estimation of the treatment effect. Propensity Scores estimate the likelihood of receiving treatment based on observed covariates:
+
+$$
+P(A = 1 | L) = e(L)
+$$
+
+Propensity Scores enable the creation of comparable groups within treated and untreated cohorts, facilitating unbiased causal effect estimates.Adjustments via Propensity Scores allow for comparing outcomes in groups with similar propensity scores, estimating causal effects as:
+
+$$
+E[Y^{a = 1}] - E[Y^{a = 0}]
+$$
+
+```{r}
+pm.model <- propensity_matching(nhefs, f = causal_model, family = "binomial",
+                  simple = TRUE, type = "strata", quant = TRUE)
+summary(pm.model)
+```
+
+We then use the `doubly_robust()` function trains both an outcome model and a propensity model to generate
+predictions for the outcome and probability of treatment respectively. 
+
+```{r}
+p.mod <- propensity_scores(nhefs, f = causal_model, family = "binomial",
+                  simple = T)
+p.scores <- p.mod$p.scores
+dr.model <- doubly_robust(out.mod = pm.model, p.scores = p.scores,  data = nhefs)
+print(dr.model)
+```
+```{r}
+ate_dr <- dr.model$ATE
+se_dr <- dr.model$ATE.summary[[2]]
+LI_dr <- ate_dr - 1.96 * se_dr
+UI_dr <- ate_dr + 1.96 * se_dr
+
+print(paste("Average Treatment Effect (ATE) using Doubly-Robust Estimator:", ate_dr))
+print(paste("95% Confidence Interval for ATE:", LI_dr, "-", UI_dr))
+```
+
+Based on the results, the estimated causal effect of smoking cessation on weight gain is 2.6 kg, with a 95% confidence interval of (1.85, 3.34). This indicates that individuals who quit smoking gained an average of 2.6 kg more than those who did not quit, after adjusting for confounding variables. The doubly-robust estimator provides a robust and efficient method for estimating causal effects in observational studies by combining outcome and propensity score models to improve the accuracy of the estimates.
+
+## Instrumental Variable Estimation 
+Instrumental variable (IV) estimation is a method used to estimate the causal effect of a treatment on an outcome when there is unmeasured confounding. The IV is a variable that is correlated with the treatment but not directly with the outcome, making it a suitable instrument to isolate the causal effect of the treatment. In the context of our analysis, we can use an IV to estimate the causal effect of smoking cessation on weight gain while accounting for unobserved confounders that may influence both smoking cessation and weight gain.
+
+In IV analysis, the relationship between the treatment and an instrumental variable helps to segregate the portion of variability in treatment that is independent of unobserved confounders. By regressing the independent variable (treatment) on the instrumental variable and examining the residuals, we can isolate the direct effect of the treatment on the outcome, free from the influence of unobserved confounders.
+
+In this analysis, we consider the price of cigarettes as an instrumental variable under the premise that it satisfies the critical conditions for a valid instrument:
+
+1. **Relevance**: The decision to quit smoking is influenced by the price of cigarettes, with higher prices serving as a deterrent.
+2. **Exclusivity**: The effect of cigarette pricing on weight change is mediated solely through its impact on smoking cessation, without a direct link.
+3. **Independence**: There are no underlying common causes between cigarette pricing and weight change, ensuring the instrument's exogeneity.
+
+We again initialize the instrumental variable estimation by defining the treatment and outcome variables, along with the covariates:
+
+
+```{r}
+nhefs.iv <- nhefs[which(!is.na(nhefs$wt82) & !is.na(nhefs$price82)),]
+nhefs.iv$highprice <- as.factor(ifelse(nhefs.iv$price82>=1.5, 1, 0))
+init_params(wt82_71, qsmk,covariates = confounders,data = nhefs.iv)
+```
+
+```{r}
+ iv_est("highprice", nhefs.iv, n.boot = 2)
+```
+However, the `CausalModels` package only currently uses the only nonparametric function implemented in the package. Instead, we will use 2SLS method to estimate the causal effect of smoking cessation on weight gain using the price of cigarettes as an instrumental variable. 
+
+```{r}
+iv_2sls <- tsls(wt82_71 ~ qsmk, ~ highprice, data = nhefs.iv)
+summary(iv_2sls)
+ate_iv <- iv_2sls$coefficients[['qsmk1']]
+LI_iv <- confint(iv_2sls)[2]
+UI_iv <- confint(iv_2sls)[4]
+```
+
+These results indicate that the instrument is weak as it increases the bias in the estimate.This leads to lead to smaller denominator of the IV estimator and overestimate of the treatment effect. 
+
+# Discussion
+
+To summarize all the findings, here is the comparison of the causal effect estimates of smoking cessation on weight gain using different causal inference methods:
+
+```{r, echo=FALSE}
+results_df <- data.frame(
+  Method = c("IPW-MSM Using Standard Weights", "IPW-MSM Using Stabilized Weights", "Standardization",
+             "G-Estimation using Linear Mean", "G-Estimation using Grid Search", "Doubly-Robust Models", "Instrumental Variables"),
+  ATE_Estimate = c(ate_standard, 
+                   ate_stabilized,
+                   standardized_effect, 
+                   ate_gest, 
+                   ate_gest_grid, 
+                   ate_dr,
+                   ate_iv), 
+  Lower_CI = c(LI_standard,
+               LI_stabilized, 
+               LI_standardized, 
+               LI_gest, 
+               LI_gest_grid, 
+               LI_dr, LI_iv),   
+  Upper_CI = c(UI_standard, 
+               UI_stabilized,
+               UI_standardized, 
+               UI_gest,
+               UI_gest_grid,
+               UI_dr, UI_iv)       
+)
+
+print(results_df)
+
+
+```
+Based on these results, IPW-MSM using stabilized weights, standardization, G-estimation methods provide similar estimates of the causal effect of smoking cessation on weight gain, with all methods yielding an average treatment effect of around 3.44-3.46 kg.  The instrumental variable estimation using the 2SLS method indicates a potential bias due to the weak instrument, leading to an overestimation of the treatment effect. The doubly-robust estimator provides a slightly lower estimate of the treatment effect compared to other methods, suggesting a more conservative approach to estimating causal effects. Overall, the results from different causal inference methods are almost consistent in demonstrating a significant increase in weight gain associated with smoking cessation.
+
+```{r}
+ggplot(data = results_df, aes(x = Method, y = ATE_Estimate)) + 
+  geom_point() + 
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), width = 0.2) +
+  geom_hline(yintercept = dr.model$ATE_summary[1], linetype = "dashed", color = "red") +  # Now using yintercept correctly
+  theme_minimal() +
+  labs(title = "Comparison of Causal Inference Methods",
+       x = "Method", y = "Average Treatment Effect") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_cartesian(ylim = c(1.5, 5))  
+
+```
+
+ 
+### IPW
+
+In this analysis, we examine the distribution of Inverse Probability (IP) weights by sex and smoking cessation status to assess the balance of covariates between treatment and control groups after applying IP weighting techniques. The comparison reveals that the sums of weights differ significantly between groups, particularly when comparing stabilized and standard IP weighting approaches. Stabilized weights demonstrate a pronounced adjustment for the probability of treatment based on covariates, leading to a decrease in the sum of weights for individuals more likely to have received the treatment (quitters). This adjustment suggests that stabilized IP weighting effectively accounts for individual propensities to receive treatment, thereby aiming to mitigate potential confounding factors. Conversely, standard IP weights show a more uniform distribution across groups, reflecting an alternative method of balancing covariate distributions without as pronounced adjustments for treatment probabilities. This analysis highlights the importance of selecting an appropriate weighting method based on the study's specific needs and the characteristics of the data to ensure balanced representation of treatment and control groups in causal inference studies.
+
+### Standardization
+
+The standardization analysis provides a robust estimate of the causal effect of smoking cessation on weight gain, accounting for the distribution of covariates in the population. By creating comparable groups based on propensity scores, the standardization method allows for a more accurate estimation of the treatment effect. The results indicate that individuals who quit smoking gained an average of 3.46 kg more than those who did not quit, after adjusting for confounding variables. This analysis demonstrates the effectiveness of standardization in estimating causal effects in observational studies, providing valuable insights into the impact of smoking cessation on weight gain.
+
+### G-Estimation
+
+G-estimation offers a comprehensive approach to estimating causal effects in observational studies, particularly in the presence of time-varying confounders. By fitting structural nested models, we can account for the dynamic nature of treatment and confounders over time, providing a more accurate estimate of the causal effect. This method allows for a nuanced exploration of causal effects, considering the influence of individual smoking intensity and baseline characteristics on weight gain.
+
+### Propensity Score Matching and Doubly-Robust Estimators
+
+Propensity score matching and doubly-robust estimators provide alternative methods for estimating causal effects in observational studies. By creating balanced groups based on propensity scores, propensity score matching allows for a more accurate estimation of the treatment effect. The doubly-robust estimator combines outcome and propensity score models to improve the accuracy of the estimates, offering a robust method for estimating causal effects in observational studies. 
+
+### Instrumental Variable Estimation
+
+Instrumental variable estimation offers a unique approach to estimating causal effects in the presence of unmeasured confounding. By using an instrumental variable that is correlated with the treatment but not directly with the outcome, we can isolate the causal effect of the treatment. In this analysis, the price of cigarettes serves as an instrumental variable to estimate the causal effect of smoking cessation on weight gain. The results indicate that the instrument is weak, leading to potential bias in the estimate. This analysis highlights the importance of selecting a valid instrument to ensure accurate estimation of causal effects.
+
+# References
+
+<div id="refs"></div>

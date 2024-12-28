@@ -1,0 +1,7 @@
+Very good analysis. I appreciate all the different approaches taken, including the
+G-methods and doubly-robust estimators that we have not seen in class. The
+discussion summarizes very well all the methodologies employed and their
+results, but it lacks a reflection on how would you improve the study, or if
+it could be improved at all.
+
+GRADE: 9.5
